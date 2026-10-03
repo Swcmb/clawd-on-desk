@@ -83,13 +83,13 @@
     parent.appendChild(subtitle);
     parent.appendChild(buildThemeActions());
 
-    // `offline` is a list-level condition, not a per-theme state: it only adds
-    // a note beside whatever cards are already known.
-    if (runtime.officialThemeListFetched && runtime.officialThemeCatalogStatus === "offline") {
-      const note = document.createElement("div");
-      note.className = "placeholder-desc theme-official-offline-note";
-      note.textContent = t("themeOfficialOffline");
-      parent.appendChild(note);
+    // `offline` / `invalid` are list-level conditions, not per-theme states:
+    // they add a note beside whatever cards are already known. The check is
+    // "is the catalog usable" rather than one specific status, so a first-run
+    // fetch that left an empty disk cache can never render as a silently absent
+    // Official themes section.
+    if (runtime.officialThemeListFetched && runtime.officialThemeCatalogStatus !== "ok") {
+      parent.appendChild(buildCatalogUnavailableNote());
     }
 
     if (runtime.themeList === null) {
@@ -133,6 +133,36 @@
     // Remember the exact list data this render was built from so a later
     // progress patch can tell whether a full re-render is actually needed.
     mountedThemeList.dataKey = officialListDataKey();
+  }
+
+  function formatCatalogCheckedAt(value) {
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return "";
+    try {
+      return new Intl.DateTimeFormat(readers.getLang() || "en", {
+        hour: "2-digit",
+        minute: "2-digit",
+      }).format(parsed);
+    } catch {
+      return parsed.toLocaleTimeString();
+    }
+  }
+
+  // One text assignment on purpose: the note is built as a single string so the
+  // rendered copy stays a single node no matter which DOM this runs against.
+  function buildCatalogUnavailableNote() {
+    const note = document.createElement("div");
+    note.className = "placeholder-desc theme-official-offline-note";
+    let text = runtime.officialThemeCatalogStatus === "invalid"
+      ? t("themeOfficialCatalogInvalid")
+      : t("themeOfficialOffline");
+    const checkedAt = runtime.officialThemeCatalogCheckedAt;
+    if (typeof checkedAt === "string" && checkedAt) {
+      const time = formatCatalogCheckedAt(checkedAt);
+      if (time) text += " " + t("themeOfficialCatalogCheckedAt").replace("{time}", time);
+    }
+    note.textContent = text;
+    return note;
   }
 
   // The official section renders from the catalog list; the local theme list
@@ -1085,6 +1115,8 @@
     return JSON.stringify([
       !!runtime.officialThemeListFetched,
       runtime.officialThemeCatalogStatus,
+      runtime.officialThemeCatalogReason,
+      runtime.officialThemeCatalogCheckedAt,
       themes,
       runtime.themeList,
     ]);

@@ -55,6 +55,24 @@ function makeNetFor(zip) {
   });
 }
 
+// Lets the timers phase run before looking for the promise a background retry
+// installs; the retry is a plain setTimeout, so setImmediate alone can overtake
+// it.
+const nextRetryTurn = () => new Promise((resolve) => setTimeout(resolve, 1));
+
+// Runs the bounded background-retry chain to exhaustion. Returns as soon as no
+// further retry is scheduled, which is also the assertion that the budget is
+// finite.
+async function drainCatalogRetries(manager, limit = 12) {
+  for (let i = 0; i < limit; i += 1) {
+    if (manager._state.catalogRetryTimer === null) return;
+    await nextRetryTurn();
+    const pending = manager._state.catalogRetryPromise;
+    if (pending) await pending;
+  }
+  throw new Error("catalog retry chain never settled");
+}
+
 let tmp;
 let prefsPath;
 let manager;
@@ -107,6 +125,12 @@ function createHarness(options = {}) {
     now: options.now,
     fetchCatalogText: options.fetchCatalogText
       || (() => Promise.resolve(JSON.stringify(catalog))),
+    // Off unless a test asks for it: the production backoff is 2s/8s, and a
+    // timer outliving a finished test would fire into an already-removed
+    // userDataDir. The retry suite opts in with explicit zero delays.
+    catalogRetryBackoffMs: Object.prototype.hasOwnProperty.call(options, "catalogRetryBackoffMs")
+      ? options.catalogRetryBackoffMs
+      : [],
     downloadArchive: options.downloadArchive,
     ensurePreviewFile: options.ensurePreviewFile,
   });
@@ -313,6 +337,196 @@ describe("official theme main", () => {
     assert.strictEqual(manager._state.catalogStatus, "offline");
     const onDisk = catalogModule.readCatalogCache({ userDataDir: tmp });
     assert.strictEqual(onDisk.catalogVersion, 3, "disk cache must not be overwritten by v2");
+  });
+
+  it("reports why the official list is empty after a cold fetch failure with no cache", async () => {
+    let fetches = 0;
+    const { manager } = createHarness({
+      fetchCatalogText: () => {
+        fetches += 1;
+        return Promise.reject(Object.assign(new Error("catalog request stalled"), {
+          code: catalogModule.ERROR_CODES.CATALOG_OFFLINE,
+        }));
+      },
+    });
+    assert.strictEqual(fs.existsSync(catalogModule.catalogCachePath(tmp)), false, "first run: no disk cache");
+
+    const listing = await manager.listOfficialThemes();
+
+    assert.strictEqual(listing.status, "ok");
+    assert.strictEqual(listing.themes.length, 0, "no validated catalog means no cards");
+    // The empty list has to carry why it is empty and when we looked, or the
+    // Theme tab drops the whole Official themes section with nothing to show.
+    assert.strictEqual(listing.catalogStatus, "offline");
+    assert.strictEqual(listing.catalogReason, catalogModule.ERROR_CODES.CATALOG_OFFLINE);
+    assert.strictEqual(typeof listing.checkedAt, "string");
+    assert.ok(listing.checkedAt.length > 0, "a failed attempt must still be timestamped");
+    assert.strictEqual(fetches, 1);
+
+    const meta = catalogModule.readCatalogAttemptMeta({ userDataDir: tmp });
+    assert.strictEqual(meta.status, "offline");
+    assert.strictEqual(meta.reason, catalogModule.ERROR_CODES.CATALOG_OFFLINE);
+    assert.strictEqual(meta.checkedAt, listing.checkedAt, "the record matches what the UI was told");
+    assert.strictEqual(meta.catalogVersion, null, "no last-known-good existed to report");
+  });
+
+  it("distinguishes a rejected catalog document from an unreachable endpoint", async () => {
+    const { manager } = createHarness({
+      fetchCatalogText: () => Promise.resolve("{not json"),
+    });
+
+    const listing = await manager.listOfficialThemes();
+
+    assert.strictEqual(listing.themes.length, 0);
+    assert.strictEqual(listing.catalogStatus, "invalid");
+    assert.strictEqual(listing.catalogReason, catalogModule.ERROR_CODES.CATALOG_INVALID);
+    assert.ok(listing.checkedAt);
+    assert.strictEqual(catalogModule.readCatalogAttemptMeta({ userDataDir: tmp }).status, "invalid");
+  });
+
+  it("recovers the official list through the background retry without a manual refresh", async () => {
+    const zip = hashSageFixture();
+    const entry = buildZipEntry(zip);
+    // A preview is declared so the adopted catalog survives the cache
+    // round-trip, exactly like the published entries do.
+    entry.preview = {
+      url: "https://github.com/rullerzhou-afk/clawd-themes/releases/download/hash-sage-v1.0.0/hash-sage-1.0.0.preview.webp",
+      bytes: 7,
+      sha256: "b".repeat(64),
+    };
+    const catalog = makeCatalog(entry, 3);
+    let fetches = 0;
+    const { manager } = createHarness({
+      catalog,
+      catalogRetryBackoffMs: [0, 0],
+      ensurePreviewFile: async () => ({ path: null }),
+      fetchCatalogText: () => {
+        fetches += 1;
+        // The cold fetch dies like a stalled first run; the retry gets through.
+        if (fetches === 1) {
+          return Promise.reject(Object.assign(new Error("catalog request stalled"), {
+            code: catalogModule.ERROR_CODES.CATALOG_OFFLINE,
+          }));
+        }
+        return Promise.resolve(JSON.stringify(catalog));
+      },
+    });
+
+    assert.strictEqual(await manager.ensureCatalogReady(), "offline");
+    assert.strictEqual(fetches, 1, "the cold attempt alone does not recover");
+    assert.strictEqual(manager._state.catalog, null);
+
+    await drainCatalogRetries(manager);
+
+    assert.strictEqual(fetches, 2, "the background retry re-attempted the endpoint");
+    assert.strictEqual(manager._state.catalog.catalogVersion, 3, "the retry adopted the catalog");
+    assert.strictEqual(manager._state.catalogStatus, "ok");
+    assert.strictEqual(manager._state.catalogReason, null);
+    assert.strictEqual(
+      catalogModule.readCatalogAttemptMeta({ userDataDir: tmp }),
+      null,
+      "a recovered catalog leaves nothing degraded to report",
+    );
+    assert.strictEqual(catalogModule.readCatalogCache({ userDataDir: tmp }).catalogVersion, 3);
+
+    const listing = await manager.listOfficialThemes();
+    assert.strictEqual(listing.catalogStatus, "ok");
+    assert.strictEqual(listing.themes.length, 1);
+    assert.strictEqual(listing.themes[0].id, "hash-sage");
+  });
+
+  it("spends its background retry budget once per process and stops", async () => {
+    let fetches = 0;
+    const { manager } = createHarness({
+      catalogRetryBackoffMs: [0, 0],
+      fetchCatalogText: () => {
+        fetches += 1;
+        return Promise.reject(Object.assign(new Error("catalog request stalled"), {
+          code: catalogModule.ERROR_CODES.CATALOG_OFFLINE,
+        }));
+      },
+    });
+
+    assert.strictEqual(await manager.ensureCatalogReady(), "offline");
+    await drainCatalogRetries(manager);
+
+    assert.strictEqual(fetches, 3, "cold attempt plus exactly two background retries");
+    assert.strictEqual(manager._state.catalogRetryAttempt, 2);
+    assert.strictEqual(manager._state.catalogRetryTimer, null);
+
+    // A later explicit attempt is still allowed, but it must not refill the
+    // background budget for this process.
+    assert.strictEqual(await manager.ensureCatalogReady(), "offline");
+    assert.strictEqual(fetches, 4);
+    await drainCatalogRetries(manager);
+    assert.strictEqual(fetches, 4, "the retry budget stays spent");
+  });
+
+  it("a regressing catalog arriving on a background retry cannot overwrite a higher last-known-good", async () => {
+    const entry = buildZipEntry(hashSageFixture());
+    let fetches = 0;
+    const { manager } = createHarness({
+      catalogRetryBackoffMs: [0, 0],
+      fetchCatalogText: () => {
+        fetches += 1;
+        if (fetches === 1) {
+          return Promise.reject(Object.assign(new Error("catalog request stalled"), {
+            code: catalogModule.ERROR_CODES.CATALOG_OFFLINE,
+          }));
+        }
+        // The endpoint is serving a stale edge copy; retrying must not help.
+        return Promise.resolve(JSON.stringify(makeCatalog(entry, 1)));
+      },
+    });
+    catalogModule.writeCatalogCache({ userDataDir: tmp, catalog: makeCatalog(entry, 4) });
+
+    assert.strictEqual(await manager.ensureCatalogReady(), "offline");
+    assert.strictEqual(manager._state.catalog.catalogVersion, 4, "cold fetch fell back to the disk cache");
+
+    await drainCatalogRetries(manager);
+
+    assert.ok(fetches >= 2, "the retry actually re-attempted the endpoint");
+    assert.strictEqual(manager._state.catalog.catalogVersion, 4, "the regression must not win");
+    assert.strictEqual(manager._state.catalogStatus, "offline");
+    assert.strictEqual(manager._state.catalogReason, catalogModule.ERROR_CODES.CATALOG_REGRESSION);
+    assert.strictEqual(catalogModule.readCatalogCache({ userDataDir: tmp }).catalogVersion, 4);
+    const meta = catalogModule.readCatalogAttemptMeta({ userDataDir: tmp });
+    assert.strictEqual(meta.status, "offline");
+    assert.strictEqual(meta.reason, catalogModule.ERROR_CODES.CATALOG_REGRESSION);
+    assert.strictEqual(meta.catalogVersion, 4, "the retained last-known-good is recorded");
+  });
+
+  it("clears a previous failure record once a catalog is adopted", async () => {
+    const { manager } = createHarness();
+    assert.strictEqual(catalogModule.writeCatalogAttemptMeta({
+      userDataDir: tmp,
+      status: "offline",
+      reason: catalogModule.ERROR_CODES.CATALOG_OFFLINE,
+      checkedAt: "2026-10-03T09:00:00.000Z",
+      catalogVersion: null,
+    }), true);
+
+    const listing = await manager.listOfficialThemes();
+
+    assert.strictEqual(listing.catalogStatus, "ok");
+    assert.strictEqual(listing.catalogReason, null);
+    assert.strictEqual(catalogModule.readCatalogAttemptMeta({ userDataDir: tmp }), null);
+  });
+
+  it("backfills the last attempt time from the persisted record before this process fetches", async () => {
+    const { manager } = createHarness();
+    catalogModule.writeCatalogAttemptMeta({
+      userDataDir: tmp,
+      status: "offline",
+      reason: catalogModule.ERROR_CODES.CATALOG_OFFLINE,
+      checkedAt: "2026-10-03T09:00:00.000Z",
+      catalogVersion: 4,
+    });
+
+    assert.strictEqual(manager._state.catalogCheckedAt, null, "this process has not attempted yet");
+    const status = manager.getCatalogStatus();
+    assert.strictEqual(status.status, "uninitialized");
+    assert.strictEqual(status.checkedAt, "2026-10-03T09:00:00.000Z");
   });
 
   it("never regresses below the in-memory last-known-good when cache persistence fails", async () => {

@@ -20,6 +20,10 @@ const CATALOG_URL = "https://raw.githubusercontent.com/rullerzhou-afk/clawd-them
 const CATALOG_REPOSITORY = "rullerzhou-afk/clawd-themes";
 const CATALOG_HOST = "raw.githubusercontent.com";
 const SCHEMA_VERSION = 1;
+// Attempt bookkeeping lives beside the catalog cache, never inside it. See
+// `readCatalogAttemptMeta` for why the two cannot share a file.
+const CATALOG_META_FILENAME = "catalog-v1.meta.json";
+const CATALOG_META_SCHEMA_VERSION = 1;
 const MAX_CATALOG_BYTES = 256 * 1024;
 const MAX_CATALOG_ENTRIES = 200;
 const DEFAULT_CATALOG_STALL_TIMEOUT_MS = 10 * 1000;
@@ -608,6 +612,97 @@ function writeCatalogCache({ fs = defaultFs, path = defaultPath, userDataDir, ca
   }
 }
 
+// ── Attempt record ──
+
+function catalogMetaPath(userDataDir, pathModule = defaultPath) {
+  return pathModule.join(catalogCacheDir(userDataDir, pathModule), CATALOG_META_FILENAME);
+}
+
+// Last catalog *attempt*, successful or not: when it ran, how it ended, and the
+// last-known-good version it was measured against.
+//
+// Deliberately a separate file from catalog-v1.json. readCatalogCache() owns
+// that path and unconditionally rmSync()s any document that is not a valid
+// catalog cache envelope, so a negative record written there would be deleted by
+// the very next read — exactly the cold-start case the record exists to explain.
+// Nothing else reads this path, so a failed fetch leaves a durable trace that
+// survives the process and self-heals the same way the cache does.
+function readCatalogAttemptMeta({ fs = defaultFs, path = defaultPath, userDataDir } = {}) {
+  if (!userDataDir) return null;
+  const metaPath = catalogMetaPath(userDataDir, path);
+  const discard = () => {
+    try { fs.rmSync(metaPath, { force: true }); } catch {}
+    return null;
+  };
+  let raw;
+  try {
+    raw = fs.readFileSync(metaPath, "utf8");
+  } catch {
+    return null;
+  }
+  let doc;
+  try {
+    doc = JSON.parse(raw);
+  } catch {
+    return discard();
+  }
+  if (!isPlainObject(doc) || doc.schemaVersion !== CATALOG_META_SCHEMA_VERSION) return discard();
+  if (typeof doc.status !== "string" || !doc.status) return discard();
+  if (doc.status === "ok") return discard();
+  if (typeof doc.checkedAt !== "string" || !doc.checkedAt) return discard();
+  return {
+    status: doc.status,
+    checkedAt: doc.checkedAt,
+    reason: typeof doc.reason === "string" && doc.reason ? doc.reason : null,
+    catalogVersion: Number.isInteger(doc.catalogVersion) ? doc.catalogVersion : null,
+  };
+}
+
+function writeCatalogAttemptMeta({
+  fs = defaultFs,
+  path = defaultPath,
+  userDataDir,
+  status,
+  reason,
+  checkedAt,
+  catalogVersion,
+} = {}) {
+  if (!userDataDir || typeof status !== "string" || !status) return false;
+  const dir = catalogCacheDir(userDataDir, path);
+  const target = catalogMetaPath(userDataDir, path);
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+  const payload = {
+    schemaVersion: CATALOG_META_SCHEMA_VERSION,
+    status,
+    reason: typeof reason === "string" && reason ? reason : null,
+    checkedAt: typeof checkedAt === "string" && checkedAt
+      ? checkedAt
+      : new Date().toISOString(),
+    catalogVersion: Number.isInteger(catalogVersion) ? catalogVersion : null,
+  };
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf8");
+    fs.renameSync(tmp, target);
+    return true;
+  } catch {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    return false;
+  }
+}
+
+// A usable catalog supersedes the failure record: nothing degraded is left to
+// report once the last-known-good is fresh.
+function clearCatalogAttemptMeta({ fs = defaultFs, path = defaultPath, userDataDir } = {}) {
+  if (!userDataDir) return false;
+  try {
+    fs.rmSync(catalogMetaPath(userDataDir, path), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ── Installed-state decoration ──
 
 // Decides the per-theme officialThemeState from catalog + on-disk markers +
@@ -636,6 +731,8 @@ module.exports = {
   CATALOG_REPOSITORY,
   CATALOG_HOST,
   SCHEMA_VERSION,
+  CATALOG_META_FILENAME,
+  CATALOG_META_SCHEMA_VERSION,
   MAX_CATALOG_BYTES,
   MAX_CATALOG_ENTRIES,
   DEFAULT_CATALOG_STALL_TIMEOUT_MS,
@@ -662,6 +759,10 @@ module.exports = {
   catalogCachePath,
   readCatalogCache,
   writeCatalogCache,
+  catalogMetaPath,
+  readCatalogAttemptMeta,
+  writeCatalogAttemptMeta,
+  clearCatalogAttemptMeta,
   deriveOfficialThemeState,
   isPlainObject,
 };
