@@ -316,6 +316,99 @@ describe("official theme catalog cache", () => {
   });
 });
 
+describe("official theme catalog attempt record", () => {
+  let tmp;
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-official-catalog-meta-"));
+  });
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("round-trips a failed attempt and clears it once the catalog is usable again", () => {
+    assert.strictEqual(catalog.readCatalogAttemptMeta({ userDataDir: tmp }), null);
+    assert.strictEqual(catalog.writeCatalogAttemptMeta({
+      userDataDir: tmp,
+      status: "offline",
+      reason: catalog.ERROR_CODES.CATALOG_OFFLINE,
+      checkedAt: "2026-10-03T09:00:00.000Z",
+      catalogVersion: null,
+    }), true);
+
+    const meta = catalog.readCatalogAttemptMeta({ userDataDir: tmp });
+    assert.deepStrictEqual(meta, {
+      status: "offline",
+      checkedAt: "2026-10-03T09:00:00.000Z",
+      reason: catalog.ERROR_CODES.CATALOG_OFFLINE,
+      catalogVersion: null,
+    });
+
+    assert.strictEqual(catalog.clearCatalogAttemptMeta({ userDataDir: tmp }), true);
+    assert.strictEqual(catalog.readCatalogAttemptMeta({ userDataDir: tmp }), null);
+  });
+
+  it("records the last-known-good version alongside the failure", () => {
+    assert.strictEqual(catalog.writeCatalogAttemptMeta({
+      userDataDir: tmp,
+      status: "invalid",
+      reason: catalog.ERROR_CODES.CATALOG_INVALID,
+      checkedAt: "2026-10-03T09:00:00.000Z",
+      catalogVersion: 7,
+    }), true);
+    const meta = catalog.readCatalogAttemptMeta({ userDataDir: tmp });
+    assert.strictEqual(meta.status, "invalid");
+    assert.strictEqual(meta.catalogVersion, 7);
+  });
+
+  // A negative cache stored in official-theme/catalog-v1.json is destroyed by
+  // readCatalogCache(): that path is rmSync'd whenever the document is not a
+  // valid catalog envelope, so the record would not survive one cold start —
+  // the exact case it exists to explain.
+  it("survives readCatalogCache() discarding the catalog file", () => {
+    assert.strictEqual(catalog.writeCatalogAttemptMeta({
+      userDataDir: tmp,
+      status: "offline",
+      reason: catalog.ERROR_CODES.CATALOG_OFFLINE,
+      checkedAt: "2026-10-03T09:00:00.000Z",
+      catalogVersion: null,
+    }), true);
+    const metaPath = catalog.catalogMetaPath(tmp);
+    assert.notStrictEqual(metaPath, catalog.catalogCachePath(tmp), "must not share the cache path");
+
+    fs.mkdirSync(catalog.catalogCacheDir(tmp), { recursive: true });
+    fs.writeFileSync(catalog.catalogCachePath(tmp), "{broken", "utf8");
+    assert.strictEqual(catalog.readCatalogCache({ userDataDir: tmp }), null);
+    assert.strictEqual(fs.existsSync(catalog.catalogCachePath(tmp)), false, "cache self-healed");
+
+    assert.strictEqual(fs.existsSync(metaPath), true, "attempt record must survive the discard");
+    const meta = catalog.readCatalogAttemptMeta({ userDataDir: tmp });
+    assert.strictEqual(meta.checkedAt, "2026-10-03T09:00:00.000Z");
+    // A second read, which is what every later cold start does.
+    assert.strictEqual(catalog.readCatalogCache({ userDataDir: tmp }), null);
+    assert.strictEqual(catalog.readCatalogAttemptMeta({ userDataDir: tmp }).checkedAt, "2026-10-03T09:00:00.000Z");
+  });
+
+  it("self-heals malformed attempt records instead of trusting them", () => {
+    const metaPath = catalog.catalogMetaPath(tmp);
+    fs.mkdirSync(catalog.catalogCacheDir(tmp), { recursive: true });
+    const rejected = [
+      "{broken",
+      "null",
+      "[]",
+      JSON.stringify({ schemaVersion: 99, status: "offline", checkedAt: "2026-10-03T09:00:00.000Z" }),
+      JSON.stringify({ schemaVersion: 1, checkedAt: "2026-10-03T09:00:00.000Z" }),
+      JSON.stringify({ schemaVersion: 1, status: "offline" }),
+      // A resolved catalog has nothing degraded left to report.
+      JSON.stringify({ schemaVersion: 1, status: "ok", checkedAt: "2026-10-03T09:00:00.000Z" }),
+    ];
+    for (const raw of rejected) {
+      fs.writeFileSync(metaPath, raw, "utf8");
+      assert.strictEqual(catalog.readCatalogAttemptMeta({ userDataDir: tmp }), null, raw);
+      assert.strictEqual(fs.existsSync(metaPath), false, `${raw} removed`);
+    }
+  });
+});
+
 function fakeRequest(handler) {
   return (options) => handler(options);
 }

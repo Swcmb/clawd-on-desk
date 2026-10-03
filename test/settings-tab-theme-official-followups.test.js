@@ -227,8 +227,10 @@ function createHarness(options = {}) {
   Object.assign(core.runtime, {
     themeList,
     officialThemeList,
-    officialThemeListFetched: true,
-    officialThemeCatalogStatus: "ok",
+    officialThemeListFetched: options.officialCatalogFetched !== false,
+    officialThemeCatalogStatus: options.officialCatalogStatus || "ok",
+    officialThemeCatalogReason: options.officialCatalogReason || null,
+    officialThemeCatalogCheckedAt: options.officialCatalogCheckedAt || null,
     officialThemePendingThemeId: options.pendingThemeId || null,
     officialThemeOperation: options.operation || null,
   });
@@ -610,7 +612,107 @@ describe("official progress end-of-operation refresh", () => {
   });
 });
 
-// ── 6. List-data fingerprint gate ─────────────────────────────────────────
+// ── 6. Catalog degradation is surfaced, never a silently empty list ────────
+describe("official catalog degradation note", () => {
+  const CHECKED_AT = "2026-10-03T09:00:00.000Z";
+
+  // Formatted the same way the tab formats it, so the assertion pins the
+  // composition (which copy, then a substituted clock time) without depending
+  // on the host timezone.
+  function checkedAtSuffix(harness) {
+    const time = new Intl.DateTimeFormat("en", { hour: "2-digit", minute: "2-digit" })
+      .format(new Date(CHECKED_AT));
+    return " " + harness.t("themeOfficialCatalogCheckedAt").replace("{time}", time);
+  }
+
+  function notes(harness) {
+    return collect(harness.content, (el) => el.classList.contains("theme-official-offline-note"));
+  }
+
+  function sectionTitles(harness) {
+    return collect(harness.content, (el) => el.classList.contains("theme-section-title"))
+      .map((el) => el.textContent);
+  }
+
+  // Issue #1122: a cold fetch that failed with an empty disk cache used to drop
+  // the Official themes section entirely, leaving the tab looking healthy with
+  // nothing in it. The list may still be empty; the render may not be silent.
+  test("an unusable catalog renders a note instead of a silently absent section", () => {
+    const h = createHarness({
+      localThemes: [builtin()],
+      officialThemes: [],
+      officialCatalogStatus: "invalid",
+      officialCatalogReason: "CATALOG_INVALID",
+      officialCatalogCheckedAt: CHECKED_AT,
+    });
+    h.mount();
+
+    assert.deepStrictEqual(sectionTitles(h), ["Built-in"], "there is genuinely nothing to list");
+    const rendered = notes(h);
+    assert.strictEqual(rendered.length, 1, "the degradation must be visible");
+    const text = rendered[0].textContent;
+    assert.strictEqual(text, h.t("themeOfficialCatalogInvalid") + checkedAtSuffix(h));
+    assert.ok(!text.includes(CHECKED_AT), "the raw timestamp is not user-facing");
+  });
+
+  test("an unreachable catalog reports offline with the last-checked time", () => {
+    const h = createHarness({
+      localThemes: [builtin()],
+      officialThemes: [],
+      officialCatalogStatus: "offline",
+      officialCatalogReason: "CATALOG_OFFLINE",
+      officialCatalogCheckedAt: CHECKED_AT,
+    });
+    h.mount();
+
+    const rendered = notes(h);
+    assert.strictEqual(rendered.length, 1);
+    assert.strictEqual(rendered[0].textContent, h.t("themeOfficialOffline") + checkedAtSuffix(h));
+  });
+
+  test("cached cards and the note coexist while the catalog is degraded", () => {
+    const h = createHarness({
+      localThemes: [builtin()],
+      officialThemes: [official("hash-sage", "installed")],
+      officialCatalogStatus: "offline",
+      officialCatalogReason: "CATALOG_OFFLINE",
+      officialCatalogCheckedAt: CHECKED_AT,
+    });
+    h.mount();
+
+    assert.deepStrictEqual(sectionTitles(h), ["Built-in", "Official themes"]);
+    assert.strictEqual(notes(h).length, 1, "the note is added beside the known cards");
+  });
+
+  test("a healthy catalog renders no note", () => {
+    const h = createHarness({ localThemes: [builtin()] });
+    h.mount();
+    assert.strictEqual(notes(h).length, 0);
+  });
+
+  test("a catalog that has not been fetched yet renders no note", () => {
+    const h = createHarness({
+      localThemes: [builtin()],
+      officialCatalogFetched: false,
+      officialCatalogStatus: null,
+    });
+    h.mount();
+    assert.strictEqual(notes(h).length, 0, "pre-fetch is loading, not degradation");
+  });
+
+  test("an unparseable last-checked time is omitted rather than shown raw", () => {
+    const h = createHarness({
+      localThemes: [builtin()],
+      officialThemes: [],
+      officialCatalogStatus: "offline",
+      officialCatalogCheckedAt: "not-a-date",
+    });
+    h.mount();
+    assert.strictEqual(notes(h)[0].textContent, h.t("themeOfficialOffline"));
+  });
+});
+
+// ── 7. List-data fingerprint gate ─────────────────────────────────────────
 describe("official list data key", () => {
   const changes = [
     ["officialThemeBytes", (h) => { h.core.runtime.officialThemeList[0].officialThemeBytes = 9 * 1024 * 1024; }],
@@ -639,6 +741,13 @@ describe("official list data key", () => {
       totalBytes: 100,
     };
     assert.strictEqual(h.patch(), true, "progress-only changes stay patchable");
+  });
+
+  test("PR #1088 follow-up: patch bails when only the last-checked time changes", () => {
+    const h = createHarness({ localThemes: [builtin()] });
+    h.mount();
+    h.core.runtime.officialThemeCatalogCheckedAt = "2026-10-03T09:00:00.000Z";
+    assert.strictEqual(h.patch(), false, "the note text is part of the rendered data");
   });
 
   test("PR #1088 follow-up: the localized downloading label tracks the real percentage", () => {

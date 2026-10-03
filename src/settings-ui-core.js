@@ -128,6 +128,8 @@
     officialThemePromise: null,
     officialThemeListFetched: false,
     officialThemeCatalogStatus: null,
+    officialThemeCatalogReason: null,
+    officialThemeCatalogCheckedAt: null,
     officialThemeCatalogVersion: null,
     officialThemeOperation: null,
     officialThemePendingThemeId: null,
@@ -1883,6 +1885,8 @@
       const keepPrevious = themes.length === 0 && previous.length > 0 && !(result && result.status === "ok");
       runtime.officialThemeList = keepPrevious ? previous : themes;
       runtime.officialThemeCatalogStatus = (result && result.catalogStatus) || "offline";
+      runtime.officialThemeCatalogReason = (result && result.catalogReason) || null;
+      runtime.officialThemeCatalogCheckedAt = (result && result.checkedAt) || null;
       runtime.officialThemeCatalogVersion = result ? result.catalogVersion : null;
       runtime.officialThemeListFetched = true;
       // Only a real replacement proves the returned snapshots are newer than the
@@ -1894,6 +1898,8 @@
       console.warn("settings: listOfficialThemes failed", err);
       runtime.officialThemeList = previous;
       runtime.officialThemeCatalogStatus = "offline";
+      runtime.officialThemeCatalogReason = null;
+      runtime.officialThemeCatalogCheckedAt = null;
       runtime.officialThemeListFetched = true;
       return previous;
     });

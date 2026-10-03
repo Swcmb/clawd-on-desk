@@ -23,6 +23,11 @@ const previewModule = require("./official-theme-preview");
 const OFFICIAL_THEME_DIALOG_MAX_BYTES = 256 * 1024 * 1024;
 const ORPHAN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DELETE_RETRY_BACKOFF_MS = [40, 120, 320];
+// Bounded background recovery for a catalog fetch that failed. A first-run user
+// on a slow or briefly unreachable link must not have to click "Refresh themes"
+// to get the official list; two delayed re-attempts recover without turning the
+// endpoint into something the app hammers.
+const CATALOG_RETRY_BACKOFF_MS = Object.freeze([2000, 8000]);
 const RELOAD_SETTLE_TIMEOUT_MS = 8000;
 const PROGRESS_MIN_INTERVAL_MS = 250;
 const PREVIEW_RESOLVE_CONCURRENCY = 4;
@@ -115,6 +120,9 @@ function createOfficialThemeMain(options = {}) {
   const commitImpl = options.commitStagedInstall || installerModule.commitStagedInstall;
   const catalogFetch = options.fetchCatalogText || catalogModule.fetchCatalogText;
   const ensurePreviewFile = options.ensurePreviewFile || previewModule.ensurePreviewFile;
+  const catalogRetryBackoffMs = Object.freeze(Array.isArray(options.catalogRetryBackoffMs)
+    ? options.catalogRetryBackoffMs.filter((ms) => Number.isFinite(ms) && ms >= 0)
+    : CATALOG_RETRY_BACKOFF_MS);
 
   if (!themeLoader) throw new Error("createOfficialThemeMain requires themeLoader");
   if (!settingsController) throw new Error("createOfficialThemeMain requires settingsController");
@@ -125,6 +133,7 @@ function createOfficialThemeMain(options = {}) {
   const state = {
     catalog: null,
     catalogStatus: "uninitialized",
+    catalogReason: null,
     catalogCheckedAt: null,
     installed: new Map(),
     scanDone: false,
@@ -132,6 +141,9 @@ function createOfficialThemeMain(options = {}) {
     installInFlight: false,
     lastError: null,
     catalogPromise: null,
+    catalogRetryAttempt: 0,
+    catalogRetryTimer: null,
+    catalogRetryPromise: null,
     lastFetchMs: 0,
     maxCatalogVersion: 0,
     previewPromises: new Map(),
@@ -166,6 +178,50 @@ function createOfficialThemeMain(options = {}) {
     return parsed;
   }
 
+  // Every catalog attempt is stamped, not just the successful ones: without a
+  // timestamp on the failure path the UI cannot say when it last checked and
+  // the outage is undiagnosable after the window that produced it is gone.
+  // A non-ok outcome is also persisted (see readCatalogAttemptMeta) so it
+  // survives the process; a usable catalog clears that record.
+  function recordCatalogAttempt(status, reason) {
+    state.catalogStatus = status;
+    state.catalogReason = status === "ok" ? null : (reason || null);
+    state.catalogCheckedAt = nowIso();
+    if (status === "ok") {
+      catalogModule.clearCatalogAttemptMeta({ fs, path, userDataDir });
+      return;
+    }
+    const written = catalogModule.writeCatalogAttemptMeta({
+      fs,
+      path,
+      userDataDir,
+      status,
+      reason: state.catalogReason,
+      checkedAt: state.catalogCheckedAt,
+      catalogVersion: state.catalog ? state.catalog.catalogVersion : null,
+    });
+    if (!written) {
+      console.warn("Clawd: official theme catalog attempt record write failed");
+    }
+  }
+
+  // Shared report shape for listOfficialThemes() and getCatalogStatus(). The
+  // persisted record backfills `checkedAt` when this process has not reached an
+  // attempt of its own, so a cold start still answers "when did we last look?".
+  function catalogStatusReport() {
+    let checkedAt = state.catalogCheckedAt;
+    if (!checkedAt) {
+      const persisted = catalogModule.readCatalogAttemptMeta({ fs, path, userDataDir });
+      checkedAt = persisted ? persisted.checkedAt : null;
+    }
+    return {
+      catalogStatus: state.catalogStatus,
+      catalogReason: state.catalogReason,
+      catalogVersion: state.catalog ? state.catalog.catalogVersion : null,
+      checkedAt,
+    };
+  }
+
   // A fetched catalog may never move the last-known-good version backwards.
   // The ceiling is the highest valid version among this process's in-memory LKG
   // AND the on-disk cache, checked BEFORE any state/cache mutation: a fresh
@@ -182,8 +238,6 @@ function createOfficialThemeMain(options = {}) {
     }
     state.catalog = nextCatalog;
     state.maxCatalogVersion = nextCatalog.catalogVersion;
-    state.catalogStatus = "ok";
-    state.catalogCheckedAt = nowIso();
     const written = catalogModule.writeCatalogCache({
       fs,
       path,
@@ -208,18 +262,20 @@ function createOfficialThemeMain(options = {}) {
     return true;
   }
 
-  // Refreshes the catalog at most once per process unless `force`. A failed or
-  // regressing catalog keeps the current last-known-good and reports a
-  // list-level offline condition; it never wipes an installed theme.
-  async function ensureCatalogReady(force = false) {
-    if (state.catalog && state.catalogStatus === "ok" && !force) return state.catalogStatus;
+  // One network attempt. Never touches the retry budget, so every caller —
+  // first paint, an explicit refresh, a background retry — funnels through the
+  // same single-flight and the same version ceiling.
+  function ensureCatalogAttempt() {
     if (state.catalogPromise) return state.catalogPromise;
     state.catalogPromise = (async () => {
       try {
         const parsed = await fetchAndValidate(undefined);
         if (!parsed.ok) {
           if (!state.catalog) adoptCache();
-          state.catalogStatus = state.catalog ? "offline" : "invalid";
+          recordCatalogAttempt(
+            state.catalog ? "offline" : "invalid",
+            catalogModule.ERROR_CODES.CATALOG_INVALID,
+          );
           return state.catalogStatus;
         }
         try {
@@ -227,21 +283,63 @@ function createOfficialThemeMain(options = {}) {
         } catch (err) {
           if (err && err.code === catalogModule.ERROR_CODES.CATALOG_REGRESSION) {
             if (!state.catalog) adoptCache();
-            state.catalogStatus = state.catalog ? "offline" : "invalid";
+            recordCatalogAttempt(
+              state.catalog ? "offline" : "invalid",
+              catalogModule.ERROR_CODES.CATALOG_REGRESSION,
+            );
             return state.catalogStatus;
           }
           throw err;
         }
+        recordCatalogAttempt("ok", null);
         return state.catalogStatus;
       } catch (err) {
         if (!state.catalog) adoptCache();
-        state.catalogStatus = "offline";
+        recordCatalogAttempt(
+          "offline",
+          (err && err.code) || catalogModule.ERROR_CODES.CATALOG_OFFLINE,
+        );
         return state.catalogStatus;
       } finally {
         state.catalogPromise = null;
       }
     })();
     return state.catalogPromise;
+  }
+
+  // Schedules the next bounded background retry. `catalogRetryAttempt` only ever
+  // increases, so a process spends a fixed extra-request budget over its
+  // lifetime rather than re-entering this on every render; the timer is unref'd
+  // so a pending retry can never keep the app alive on its own.
+  function scheduleCatalogRetry() {
+    if (state.catalogRetryTimer !== null) return;
+    if (state.catalogRetryAttempt >= catalogRetryBackoffMs.length) return;
+    const delayMs = catalogRetryBackoffMs[state.catalogRetryAttempt];
+    state.catalogRetryAttempt += 1;
+    const timer = setTimeout(() => {
+      state.catalogRetryTimer = null;
+      state.catalogRetryPromise = ensureCatalogAttempt()
+        .then((status) => {
+          if (status !== "ok") scheduleCatalogRetry();
+          return status;
+        })
+        .catch(() => {
+          scheduleCatalogRetry();
+          return "offline";
+        });
+    }, delayMs);
+    if (timer && typeof timer.unref === "function") timer.unref();
+    state.catalogRetryTimer = timer;
+  }
+
+  // Refreshes the catalog at most once per process unless `force`. A failed or
+  // regressing catalog keeps the current last-known-good, records the attempt
+  // and reports a list-level condition; it never wipes an installed theme.
+  async function ensureCatalogReady(force = false) {
+    if (state.catalog && state.catalogStatus === "ok" && !force) return state.catalogStatus;
+    const status = await ensureCatalogAttempt();
+    if (status !== "ok") scheduleCatalogRetry();
+    return status;
   }
 
   // ── Installed scan ──
@@ -462,9 +560,7 @@ function createOfficialThemeMain(options = {}) {
     themes.sort((a, b) => String(a.id).localeCompare(String(b.id)));
     return {
       status: "ok",
-      catalogStatus: state.catalogStatus,
-      catalogVersion: state.catalog ? state.catalog.catalogVersion : null,
-      checkedAt: state.catalogCheckedAt,
+      ...catalogStatusReport(),
       themes,
     };
   }
@@ -1035,11 +1131,7 @@ function createOfficialThemeMain(options = {}) {
 
   return {
     ensureCatalogReady,
-    getCatalogStatus: () => ({
-      status: state.catalogStatus,
-      catalogVersion: state.catalog ? state.catalog.catalogVersion : null,
-      checkedAt: state.catalogCheckedAt,
-    }),
+    getCatalogStatus: () => ({ status: state.catalogStatus, ...catalogStatusReport() }),
     listOfficialThemes,
     decorateThemeMetadata,
     installTheme,
@@ -1061,4 +1153,5 @@ module.exports.MANAGER_ERROR_CODES = MANAGER_ERROR_CODES;
 module.exports.ORPHAN_MAX_AGE_MS = ORPHAN_MAX_AGE_MS;
 module.exports.OFFICIAL_THEME_DIALOG_MAX_BYTES = OFFICIAL_THEME_DIALOG_MAX_BYTES;
 module.exports.PROGRESS_MIN_INTERVAL_MS = PROGRESS_MIN_INTERVAL_MS;
+module.exports.CATALOG_RETRY_BACKOFF_MS = CATALOG_RETRY_BACKOFF_MS;
 module.exports.__test = { rmWithRetry, isBusyFsError, mapWithConcurrency };
