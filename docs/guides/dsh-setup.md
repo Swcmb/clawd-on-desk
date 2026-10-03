@@ -99,9 +99,49 @@ mode is enabled; per-session grants are not offered in this experimental release
   pnpm.
 - Preferably a global `dsh` CLI on `PATH` for automatic install, repair, and
   uninstall.
+- **Node.js `>=22.19.0`** on the `0.1.x` patched line. This is the range the
+  bridge is tested against. Lower patch releases install and pass `--version`,
+  but `npm warn EBADENGINE` from a dependency (`undici@8.11.2`,
+  `@earendil-works/pi-ai@0.85.1`, both requiring `>=22.19.0`) means a
+  contract-pinned install on an older `22.x` minor is unverified.
 
 `DSH_HOME` is honored when it is a trimmed non-empty value; otherwise Clawd uses
 `~/.dsh`.
+
+### Windows: PATH and restarts
+
+Two Windows-specific details decide whether an otherwise correct install appears
+to work.
+
+**Clawd needs the npm global bin directory on the *user-level* PATH.** Clawd is a
+GUI (Electron) process: it never sources a shell profile, so a `dsh` CLI that only
+an interactive shell can resolve — because `%APPDATA%\npm` is on the
+machine-level PATH but missing from `HKCU\Environment` — is invisible to the
+installer. On Windows Clawd therefore ensures `%APPDATA%\npm` is present on the
+user-level PATH. The change is additive: existing entries are preserved and the
+directory is appended, never reordered. If the registry cannot be read or written,
+the install still proceeds unchanged.
+
+**A PATH change cannot reach a running Clawd.** Electron caches `process.env` at
+startup, so a PATH edit made after launch has no effect on the current process —
+even after `WM_SETTINGCHANGE` is broadcast. **Fully quit and relaunch Clawd**
+(confirm no `Clawd on Desk` processes remain) after any PATH change. Restart
+`dsh web` as well, so it picks up the newly installed plugin generation.
+
+### Which `dsh` gets probed
+
+Clawd enumerates the `dsh` candidates on `PATH` and prefers one whose reported
+version is in its contract table, instead of taking the first hit. This matters
+on Windows because the desktop bundle ships its own `dsh` shim which can resolve
+first and report a version the bridge does not support; without enumeration a
+correctly installed contract-matching CLI later on the same `PATH` would be
+ignored. If no candidate reports a contract version, Clawd falls back to the
+first resolved candidate and reports it as unsupported rather than silently
+skipping it. The contract table is exact-match and is never widened at runtime.
+
+Note that installing the contract version can make the terminal's `dsh` and the
+desktop bundle's internal CLI report different versions. That is expected: they
+are independent surfaces, each correct for its own consumer.
 
 ## Install and repair
 
@@ -113,6 +153,12 @@ click **Install**. Install succeeds only after Clawd has:
 2. called `dsh plugin --profile web add <generation>`;
 3. verified both DSH profile rows, the final profile-local package resolution,
    the Clawd ownership marker, protocol, compatibility range, and bundle hash.
+
+The `plugin add` target is the **generation directory**
+(`…/generations/<bundle-hash>`), which is the plugin root and carries its
+`package.json`. The `homes/<dsh-home-hash>/` directory above it is only a
+namespace: it holds `generations/` and the marker file, no `package.json`, so
+passing it to `plugin add` fails even with a working CLI.
 
 The same operation is available for development:
 
@@ -143,7 +189,40 @@ exact path, and retains managed generations for manual inspection.
 Startup sync repairs only an already opted-in, installed-and-enabled integration.
 It never initializes a missing DSH profile. Settings Install or explicit Doctor
 Repair may allow the official CLI to initialize that profile. A running `dsh web`
-process may need a restart after install or repair.
+process may need a restart after install or repair — restart it so the new
+plugin generation is actually loaded.
+
+### pnpm `allowBuilds` placeholder
+
+`dsh plugin add` can abort in the profile directory with:
+
+```
+[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: @aiwayds/dsh-subagent-registry@<version>
+Run "pnpm approve-builds" to pick which dependencies should be allowed to run scripts.
+```
+
+The cause is usually a profile's `pnpm-workspace.yaml` shipping pnpm's
+human-facing placeholder instead of a decision:
+
+```yaml
+allowBuilds:
+  '@aiwayds/dsh-subagent-registry': set this to true or false
+```
+
+pnpm writes that placeholder when it cannot decide whether a dependency's build
+scripts may run. pnpm `11.4.0` then treats the value as unset and fails closed.
+Edit the file and set each entry explicitly — `true` to allow the build scripts,
+or `false` to keep them blocked:
+
+```yaml
+allowBuilds:
+  '@aiwayds/dsh-subagent-registry': false
+```
+
+`false` is the safe choice when you do not need that package's build step; the
+install then completes. Only use `true` for a dependency you trust. This is a
+file in your own DSH profile under `~/.dsh/profiles/<profile>/`; Clawd does not
+rewrite it for you.
 
 ### Mutation lock recovery
 

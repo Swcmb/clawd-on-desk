@@ -452,6 +452,9 @@ async function resolveDshCommand(options = {}) {
     }
     return { command: bin, prefixArgs: [], installRoot, env };
   }
+  // Windows: a GUI process sees only the user-level PATH it inherited at
+  // startup, so make sure the npm global bin directory is on it before probing.
+  await ensureWindowsUserPathForNpmGlobal(options);
   const shims = await whereCommands("dsh", options);
   if (shims.length === 0) return null;
   const candidates = [];
@@ -461,15 +464,48 @@ async function resolveDshCommand(options = {}) {
   }
   const nodeRunner = await resolveNodeRunner(options);
   if (nodeRunner) {
+    // The bundled desktop shim can resolve first on PATH while reporting a
+    // version this bridge does not support, which would reject an otherwise
+    // usable contract-matching CLI installed later on the same PATH. Probe each
+    // candidate and prefer one whose version is in DSH_VERSION_CONTRACTS.
+    // A probe that throws or reports nothing is simply "not a match": it never
+    // wins, and it never turns a would-be failure into a success.
+    const resolvable = [];
     for (const binJs of [...new Set(candidates)]) {
       if (!(await exists(binJs))) continue;
-      const packageRoot = path.dirname(path.dirname(binJs));
-      return { command: nodeRunner, prefixArgs: [binJs], installRoot: packageRoot };
+      resolvable.push({ binJs, installRoot: path.dirname(path.dirname(binJs)) });
+    }
+    for (const candidate of resolvable) {
+      const version = await probeDshCandidateVersion(nodeRunner, candidate.binJs, options);
+      if (version === null || !dshContractForVersion(version)) continue;
+      return { command: nodeRunner, prefixArgs: [candidate.binJs], installRoot: candidate.installRoot };
+    }
+    // No candidate matched a contract (or none could be probed). Fall back to the
+    // first-hit behaviour so an unsupported CLI is still reported as unsupported
+    // rather than silently skipped.
+    if (resolvable.length > 0) {
+      return { command: nodeRunner, prefixArgs: [resolvable[0].binJs], installRoot: resolvable[0].installRoot };
     }
   }
   const executable = shims.find((shim) => /\.exe$/i.test(shim));
   if (executable) return { command: executable, prefixArgs: [], installRoot: null };
   return null;
+}
+
+// Reads one candidate's version without ever rejecting: a non-zero exit, a
+// timeout, or unparseable output all resolve to null so the caller can keep
+// enumerating. Never widens what DSH_VERSION_CONTRACTS accepts.
+async function probeDshCandidateVersion(nodeRunner, binJs, options = {}) {
+  try {
+    const result = await runCommand(nodeRunner, [binJs, "--version"], {
+      ...commandExecutionOptions({ command: nodeRunner }, options),
+      timeoutMs: 5000,
+    });
+    if (!result || result.code !== 0) return null;
+    return parseDshVersion(`${result.stdout}\n${result.stderr}`);
+  } catch {
+    return null;
+  }
 }
 
 function parseDshVersion(value) {
@@ -519,6 +555,68 @@ async function hasDshCommand(options = {}) {
     timeoutMs: 5000,
   });
   return result.code === 0;
+}
+
+// npm's global bin directory on Windows (%APPDATA%\npm), which is where a
+// globally installed `dsh.cmd` lands.
+function windowsNpmGlobalBinDir(options = {}) {
+  const env = options.env || process.env;
+  const appData = [env.APPDATA, env.appdata].find((v) => typeof v === "string" && v.trim());
+  return appData && appData.trim() ? path.win32.join(appData.trim(), "npm") : null;
+}
+
+function parseRegistryPathValue(stdout) {
+  const line = String(stdout || "")
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .find((entry) => /^Path\s+REG_(EXPAND_)?SZ/i.test(entry));
+  if (!line) return null;
+  // The value starts after the type token, not after the first whitespace —
+  // "Path    REG_EXPAND_SZ    C:\a" must yield "C:\a", not the type plus path.
+  const match = line.match(/^Path\s+REG_(?:EXPAND_)?SZ\s+(.*)$/i);
+  return match ? match[1] : null;
+}
+
+function pathListContains(entries, target) {
+  const wanted = String(target || "").replace(/[\\/]+$/, "").toLowerCase();
+  return entries.some((entry) => String(entry || "").replace(/[\\/]+$/, "").toLowerCase() === wanted);
+}
+
+// Ensures the npm global bin directory is on the USER-level PATH (HKCU
+// Environment), not just the machine-level PATH a shell profile may add. Clawd is
+// an Electron GUI process: it never sources a shell profile and caches
+// process.env at startup, so a CLI visible only to an interactive shell is
+// invisible to the installer.
+//
+// Additive only — an existing user PATH is preserved and the directory is
+// appended, never reordered or rewritten. Every failure path (non-Windows,
+// unreadable registry, unresolvable npm prefix, reg.exe failure) is a silent
+// no-op: this is a convenience that makes the probe work, never a gate that can
+// fail an install.
+async function ensureWindowsUserPathForNpmGlobal(options = {}) {
+  const platform = options.platform || process.platform;
+  if (platform !== "win32") return { changed: false, reason: "not-windows" };
+  const binDir = windowsNpmGlobalBinDir(options);
+  if (!binDir) return { changed: false, reason: "no-appdata" };
+  const query = await runCommand("reg.exe", ["query", "HKCU\\Environment", "/v", "Path"], {
+    ...options,
+    timeoutMs: 5000,
+  });
+  if (query.code !== 0) return { changed: false, reason: "query-failed" };
+  const current = parseRegistryPathValue(query.stdout);
+  const entries = (current || "")
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (pathListContains(entries, binDir)) return { changed: false, reason: "already-present", binDir };
+  const next = [...entries, binDir].join(";");
+  const write = await runCommand(
+    "reg.exe",
+    ["add", "HKCU\\Environment", "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", next, "/f"],
+    { ...options, timeoutMs: 5000 }
+  );
+  if (write.code !== 0) return { changed: false, reason: "write-failed", binDir };
+  return { changed: true, binDir };
 }
 
 async function resolvePnpmRuntime(commandInfo, options = {}) {
@@ -2772,6 +2870,10 @@ module.exports = {
     manualGenerationReferencePath,
     readManualGenerationReference,
     buildManualDshCommand,
+    probeDshCandidateVersion,
+    ensureWindowsUserPathForNpmGlobal,
+    windowsNpmGlobalBinDir,
+    parseRegistryPathValue,
     computeExpectedSourceHashesSync,
     digestBridgeFiles,
     dshContractForMarker,

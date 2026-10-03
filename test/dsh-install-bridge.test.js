@@ -174,6 +174,8 @@ test("Windows CLI discovery follows a pnpm-style shim instead of assuming one gl
     platform: "win32",
     resolveNodeBinAsyncImpl: async () => "C:\\Program Files\\nodejs\\node.exe",
     runCommand: async (program, args) => {
+      // #1119: the user-level PATH repair may query reg.exe before discovery.
+      if (program === "reg.exe") return { code: 1, stdout: "", stderr: "unavailable" };
       assert.strictEqual(program, "where.exe");
       assert.deepStrictEqual(args, ["dsh"]);
       return { code: 0, stdout: `${shim}\r\n` };
@@ -182,6 +184,7 @@ test("Windows CLI discovery follows a pnpm-style shim instead of assuming one gl
   assert.strictEqual(command.command, "C:\\Program Files\\nodejs\\node.exe");
   assert.deepStrictEqual(command.prefixArgs, [binJs]);
   assert.strictEqual(command.installRoot, path.dirname(path.dirname(binJs)));
+  // #1119: nothing matched a contract here, so first-hit is preserved.
 });
 
 test("POSIX CLI discovery resolves the DSH entrypoint through an absolute Node binary", {
@@ -2112,4 +2115,307 @@ test("a marker staged for an unlisted DSH version reports version-unsupported", 
     fs.existsSync(dshInstallTest.manualGenerationReferencePath({ managedRoot: harness.managedRoot })),
     false,
   );
+});
+
+// ── #1119 Windows installer remediation ──
+// Builds a fake Windows PATH tree: one directory per candidate, each holding a
+// real `lib/bin.js` so `exists()` resolves it, plus a `.cmd` shim so
+// `where.exe` enumerates it. `versionByBinJs` decides what each candidate
+// reports for `--version`.
+function makeWindowsCliTree(t, versionsByShimDir) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-dsh-path-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const shims = [];
+  for (const [dirName, version] of Object.entries(versionsByShimDir)) {
+    const binDir = path.join(root, dirName, "node_modules", "@deepseek-ai", "dsh", "lib");
+    fs.mkdirSync(binDir, { recursive: true });
+    const binJs = path.join(binDir, "bin.js");
+    fs.writeFileSync(binJs, `// ${dirName}\n`, "utf8");
+    const shim = path.join(root, dirName, "dsh.cmd");
+    fs.writeFileSync(shim, `@echo off\r\n`, "utf8");
+    shims.push({ shim, binJs, version, packageRoot: path.dirname(path.dirname(binJs)) });
+  }
+  return { root, shims };
+}
+
+// Stubs `where.exe` (PATH enumeration) and the node runner (`--version` probe)
+// so no real PATH or registry is touched.
+function windowsProbeOptions(tree, extra = {}) {
+  const versionByBinJs = new Map(tree.shims.map((s) => [s.binJs, s.version]));
+  const regCalls = [];
+  const runCommand = async (command, args) => {
+    const joined = [command, ...args].join(" ");
+    if (/where\.exe/i.test(command)) {
+      return { code: 0, stdout: tree.shims.map((s) => s.shim).join("\r\n") };
+    }
+    if (/reg\.exe/i.test(command)) {
+      regCalls.push(joined);
+      if (/query/i.test(args[0] || "")) {
+        return { code: 1, stdout: "", stderr: "stub: no user PATH" };
+      }
+      return { code: 0, stdout: "" };
+    }
+    if (args[0] === "--version") {
+      // node runner invoked with only --version can't happen; guard anyway.
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (args[1] === "--version") {
+      const v = versionByBinJs.get(args[0]);
+      if (v === undefined) return { code: 1, stdout: "", stderr: "" };
+      return { code: 0, stdout: `${v}\n`, stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return {
+    options: {
+      platform: "win32",
+      env: { APPDATA: "C:\\Users\\probe\\AppData\\Roaming" },
+      nodeBin: "node",
+      runCommand,
+      ...extra,
+    },
+    regCalls,
+  };
+}
+
+test("#1119 the Windows probe prefers a contract-matching CLI over one that resolves first", async (t) => {
+  // The bundled desktop shim resolves first and reports an unsupported version;
+  // the npm-installed contract CLI sits later on the same PATH.
+  const tree = makeWindowsCliTree(t, {
+    "bundled": "0.2.0-rc.2",
+    "npm-global": SUPPORTED_DSH_VERSION,
+  });
+  const { options } = windowsProbeOptions(tree);
+  const resolved = await resolveDshCommand(options);
+  assert.ok(resolved, "a candidate should resolve");
+  const expected = tree.shims.find((s) => s.version === SUPPORTED_DSH_VERSION);
+  assert.deepStrictEqual(
+    resolved.prefixArgs,
+    [expected.binJs],
+    "must select the contract-matching candidate, not the first-resolving one",
+  );
+  assert.strictEqual(resolved.installRoot, expected.packageRoot);
+});
+
+test("#1119 probe enumeration keeps first-hit when no candidate matches a contract", async (t) => {
+  // Nothing matches. Today's behaviour is preserved: the first hit is returned
+  // so the caller still reports version-unsupported rather than "no CLI".
+  const tree = makeWindowsCliTree(t, {
+    "bundled": "0.2.0-rc.2",
+    "other": "0.1.0-rc.7",
+  });
+  const { options } = windowsProbeOptions(tree);
+  const resolved = await resolveDshCommand(options);
+  assert.ok(resolved, "first-hit fallback must still resolve");
+  assert.deepStrictEqual(resolved.prefixArgs, [tree.shims[0].binJs]);
+});
+
+test("#1119 an unprobeable candidate never wins and never masks a later match", async (t) => {
+  const tree = makeWindowsCliTree(t, {
+    "broken": "not-a-version",
+    "good": SUPPORTED_DSH_VERSION,
+  });
+  const versionByBinJs = new Map(tree.shims.map((s) => [s.binJs, s.version]));
+  const runCommand = async (command, args) => {
+    if (/where\.exe/i.test(command)) {
+      return { code: 0, stdout: tree.shims.map((s) => s.shim).join("\r\n") };
+    }
+    if (/reg\.exe/i.test(command)) return { code: 1, stdout: "", stderr: "" };
+    if (args[1] === "--version") {
+      const v = versionByBinJs.get(args[0]);
+      if (v === "not-a-version") return { code: 0, stdout: "not-a-version\n", stderr: "" };
+      return { code: 0, stdout: `${v}\n`, stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const resolved = await resolveDshCommand({
+    platform: "win32",
+    env: { APPDATA: "C:\\Users\\probe\\AppData\\Roaming" },
+    nodeBin: "node",
+    runCommand,
+  });
+  assert.deepStrictEqual(resolved.prefixArgs, [tree.shims[1].binJs]);
+});
+
+test("#1119 probeDshCandidateVersion never throws and never invents a version", async (t) => {
+  const tree = makeWindowsCliTree(t, { x: SUPPORTED_DSH_VERSION });
+  const binJs = tree.shims[0].binJs;
+  assert.strictEqual(
+    await dshInstallTest.probeDshCandidateVersion("node", binJs, {
+      runCommand: async () => { throw new Error("spawn exploded"); },
+    }),
+    null,
+  );
+  assert.strictEqual(
+    await dshInstallTest.probeDshCandidateVersion("node", binJs, {
+      runCommand: async () => ({ code: 1, stdout: "", stderr: "nope" }),
+    }),
+    null,
+  );
+  assert.strictEqual(
+    await dshInstallTest.probeDshCandidateVersion("node", binJs, {
+      runCommand: async () => ({ code: 0, stdout: "no digits here", stderr: "" }),
+    }),
+    null,
+  );
+  assert.strictEqual(
+    await dshInstallTest.probeDshCandidateVersion("node", binJs, {
+      runCommand: async () => ({ code: 0, stdout: `${SUPPORTED_DSH_VERSION}\n`, stderr: "" }),
+    }),
+    SUPPORTED_DSH_VERSION,
+  );
+});
+
+test("#1119 an unsupported first-hit CLI still reports version-unsupported end to end", async (t) => {
+  // Proves enumeration does not fail open: an unlisted version is rejected.
+  const harness = makeHarness();
+  const cli = makeOfficialCli(harness);
+  t.after(() => fs.rmSync(harness.root, { recursive: true, force: true }));
+  const result = await installDeepSeekHarnessBridge(installOptions(harness, cli, {
+    dshVersion: "0.2.0-rc.2",
+  }));
+  assert.strictEqual(result.status, "error");
+  assert.strictEqual(result.reason, "version-unsupported");
+  assert.strictEqual(result.detectedVersion, "0.2.0-rc.2");
+  assert.deepStrictEqual(Array.from(cli.calls), []);
+});
+
+test("#1119 the npx hint still points at the staged generation directory, not the homes root", async (t) => {
+  // Regression guard for the reported bad remediation target: the advertised
+  // path must be a real plugin root that contains a package.json.
+  const harness = makeHarness();
+  const cli = makeOfficialCli(harness);
+  t.after(() => fs.rmSync(harness.root, { recursive: true, force: true }));
+  const unavailable = await installDeepSeekHarnessBridge(installOptions(harness, cli, {
+    commandInfo: null,
+    dshCommand: false,
+  }));
+  assert.strictEqual(unavailable.reason, "cli-unavailable");
+  const reference = readJson(
+    dshInstallTest.manualGenerationReferencePath({ managedRoot: harness.managedRoot })
+  );
+  const generationDir = path.join(harness.managedRoot, "generations", reference.bundleHash);
+  assert.ok(
+    unavailable.manualCommand.includes(generationDir),
+    `hint must name the generation dir: ${unavailable.manualCommand}`,
+  );
+  // The advertised path must actually be a usable plugin root...
+  assert.strictEqual(fs.existsSync(path.join(generationDir, "package.json")), true);
+  // ...and must NOT be the managed root that only holds generations/ + marker.
+  assert.strictEqual(fs.existsSync(path.join(harness.managedRoot, "package.json")), false);
+  assert.strictEqual(
+    unavailable.manualCommand.includes(`'${harness.managedRoot}'`),
+    false,
+    "hint must not point at the managed root",
+  );
+  // The generation dir is what actually carries the plugin manifest.
+  assert.strictEqual(
+    fs.existsSync(path.join(generationDir, "clawd-manifest.json")),
+    true,
+  );
+});
+
+test("#1119 the Windows PATH repair targets the user-level registry", async (t) => {
+  const result = await dshInstallTest.ensureWindowsUserPathForNpmGlobal({
+    platform: "win32",
+    env: { APPDATA: "C:\\Users\\probe\\AppData\\Roaming" },
+    runCommand: async (command, args) => {
+      if (/query/i.test(args[0] || "")) {
+        return { code: 0, stdout: "    Path    REG_EXPAND_SZ    C:\\existing\\bin\r\n", stderr: "" };
+      }
+      return { code: 0, stdout: "" };
+    },
+  });
+  assert.strictEqual(result.changed, true);
+  assert.strictEqual(result.binDir, "C:\\Users\\probe\\AppData\\Roaming\\npm");
+});
+
+test("#1119 the PATH repair preserves existing entries and appends rather than replaces", async () => {
+  const seen = [];
+  await dshInstallTest.ensureWindowsUserPathForNpmGlobal({
+    platform: "win32",
+    env: { APPDATA: "C:\\Users\\probe\\AppData\\Roaming" },
+    runCommand: async (command, args) => {
+      if (/query/i.test(args[0] || "")) {
+        return { code: 0, stdout: "    Path    REG_EXPAND_SZ    C:\\a;C:\\b\r\n", stderr: "" };
+      }
+      seen.push(args);
+      return { code: 0, stdout: "" };
+    },
+  });
+  const add = seen.find((args) => /add/i.test(args[0] || ""));
+  assert.ok(add, "must issue a reg add");
+  assert.deepStrictEqual(add.slice(0, 2), ["add", "HKCU\\Environment"]);
+  const value = add[add.indexOf("/d") + 1];
+  assert.strictEqual(value, "C:\\a;C:\\b;C:\\Users\\probe\\AppData\\Roaming\\npm");
+  // The user-level key is the whole point: a GUI process never reads HKLM.
+  assert.strictEqual(add.includes("HKCU\\Environment"), true);
+  assert.strictEqual(add.some((a) => /HKLM/i.test(String(a))), false);
+});
+
+test("#1119 the PATH repair is a no-op when the directory is already present", async () => {
+  const calls = [];
+  const result = await dshInstallTest.ensureWindowsUserPathForNpmGlobal({
+    platform: "win32",
+    env: { APPDATA: "C:\\Users\\probe\\AppData\\Roaming" },
+    runCommand: async (command, args) => {
+      calls.push([command, ...args]);
+      if (/query/i.test(args[0] || "")) {
+        return {
+          code: 0,
+          stdout: "    Path    REG_EXPAND_SZ    C:\\Users\\probe\\AppData\\Roaming\\npm\r\n",
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "" };
+    },
+  });
+  assert.strictEqual(result.changed, false);
+  assert.strictEqual(result.reason, "already-present");
+  assert.strictEqual(calls.some((c) => /add/i.test(String(c[1] || ""))), false);
+});
+
+test("#1119 the PATH repair never runs off Windows and never fails an install", async () => {
+  for (const platform of ["darwin", "linux"]) {
+    const result = await dshInstallTest.ensureWindowsUserPathForNpmGlobal({
+      platform,
+      env: { APPDATA: "C:\\Users\\probe\\AppData\\Roaming" },
+      runCommand: async () => { throw new Error("must not spawn reg.exe"); },
+    });
+    assert.strictEqual(result.changed, false);
+    assert.strictEqual(result.reason, "not-windows");
+  }
+  // Windows failures are swallowed: a refused registry write is a no-op.
+  const failed = await dshInstallTest.ensureWindowsUserPathForNpmGlobal({
+    platform: "win32",
+    env: { APPDATA: "C:\\Users\\probe\\AppData\\Roaming" },
+    runCommand: async (command, args) => {
+      if (/query/i.test(args[0] || "")) return { code: 0, stdout: "    Path    REG_EXPAND_SZ    C:\\a\r\n", stderr: "" };
+      return { code: 1, stdout: "", stderr: "access denied" };
+    },
+  });
+  assert.strictEqual(failed.changed, false);
+  assert.strictEqual(failed.reason, "write-failed");
+  // No APPDATA means nothing to add.
+  const noAppData = await dshInstallTest.ensureWindowsUserPathForNpmGlobal({
+    platform: "win32",
+    env: {},
+    runCommand: async () => { throw new Error("must not spawn reg.exe"); },
+  });
+  assert.strictEqual(noAppData.changed, false);
+  assert.strictEqual(noAppData.reason, "no-appdata");
+});
+
+test("#1119 DSH_VERSION_CONTRACTS stays exact and unlisted versions stay rejected", () => {
+  // Guards the constraint that enumeration must not become a widened allowlist.
+  for (const contract of DSH_VERSION_CONTRACTS) {
+    assert.ok(contract.version, "every contract pins an exact version");
+    assert.strictEqual(
+      dshContractForVersion(contract.version) !== null,
+      true,
+    );
+  }
+  for (const unlisted of ["0.2.0-rc.2", "0.1.5-rc.4", "0.1.0-rc.7", "0.2.0"]) {
+    assert.strictEqual(isSupportedDshVersion(unlisted), false, unlisted);
+  }
 });
